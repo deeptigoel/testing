@@ -1,0 +1,398 @@
+Yes — for your actual requirement, I’d make the first integration test use a real MLflow server backed by a local SQLite database, while using a separate SQLite database for summarization predictions.
+
+Test architecture
+                    MLflow Server
+                         │
+              ┌──────────┴──────────┐
+              │                     │
+        MLflow SQLite DB       Model artifacts
+         (tracking)                 │
+                                    │
+Your run_pipeline()                 │
+       ↓                            │
+actual summarization               │
+       ↓                            │
+prediction SQLite DB                │
+       ↓                            │
+read prediction                     │
+       ↓                            │
+MLflow loaded model ────────────────┘
+       ↓
+schema validation
+       ↓
+assert prediction
+
+Your production pipeline already calls run_pipeline(combined_text) and receives summary_results, models, then logs each returned transformer model through log_transformer_model().
+
+1. Add an MLflow server fixture to conftest.py
+import os
+import socket
+import subprocess
+import sys
+import time
+
+import mlflow
+import pytest
+
+
+def _get_free_port():
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    return port
+
+
+@pytest.fixture
+def mlflow_server(tmp_path):
+    """
+    Start a temporary MLflow server backed by SQLite.
+    """
+
+    port = _get_free_port()
+
+    backend_db = tmp_path / "mlflow.db"
+    artifact_root = tmp_path / "artifacts"
+
+    artifact_root.mkdir()
+
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "mlflow",
+            "server",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--backend-store-uri",
+            f"sqlite:///{backend_db}",
+            "--default-artifact-root",
+            str(artifact_root),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    tracking_uri = f"http://127.0.0.1:{port}"
+
+    for _ in range(30):
+        try:
+            response = __import__("requests").get(
+                f"{tracking_uri}/health",
+                timeout=1,
+            )
+
+            if response.status_code == 200:
+                break
+
+        except Exception:
+            time.sleep(1)
+
+    else:
+        process.terminate()
+        raise RuntimeError("MLflow server failed to start.")
+
+    mlflow.set_tracking_uri(tracking_uri)
+
+    yield tracking_uri
+
+    process.terminate()
+    process.wait(timeout=10)
+
+This gives every test a fresh MLflow server and SQLite backend.
+
+2. The actual integration test
+
+Put this in something like:
+
+tests/integration/test_summarization_mlflow.py
+import sqlite3
+
+import mlflow
+import pandas as pd
+import pytest
+from mlflow.models import infer_signature
+
+from summarizer import run_pipeline
+from mlflow_utils import log_transformer_model
+
+
+@pytest.mark.integration
+def test_summarization_prediction_sqlite_and_schema(
+    mlflow_server,
+    tmp_path,
+):
+    """
+    Verify summarization prediction is stored in SQLite,
+    loaded through MLflow, and returned with the expected schema.
+    """
+
+    # ---------------------------------------------------------
+    # 1. Input for YOUR actual summarization pipeline
+    # ---------------------------------------------------------
+    combined_text = (
+        "This is a sample document for testing the summarization "
+        "pipeline. It contains information that should be summarized."
+    )
+
+    # ---------------------------------------------------------
+    # 2. Run YOUR actual summarization pipeline
+    # ---------------------------------------------------------
+    summary_results, models = run_pipeline(
+        combined_text
+    )
+
+    assert summary_results
+    assert models
+
+    # ---------------------------------------------------------
+    # 3. Create SQLite DB for prediction results
+    # ---------------------------------------------------------
+    prediction_db = (
+        tmp_path / "summarization_predictions.db"
+    )
+
+    conn = sqlite3.connect(prediction_db)
+
+    conn.execute(
+        """
+        CREATE TABLE predictions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            input_text TEXT NOT NULL,
+            model_name TEXT NOT NULL,
+            prediction TEXT NOT NULL
+        )
+        """
+    )
+
+    # ---------------------------------------------------------
+    # 4. Store YOUR actual summarization results
+    # ---------------------------------------------------------
+    for model_name, prediction in summary_results.items():
+
+        conn.execute(
+            """
+            INSERT INTO predictions
+                (input_text, model_name, prediction)
+            VALUES (?, ?, ?)
+            """,
+            (
+                combined_text,
+                model_name,
+                str(prediction),
+            ),
+        )
+
+    conn.commit()
+    conn.close()
+
+    # ---------------------------------------------------------
+    # 5. Verify SQLite storage
+    # ---------------------------------------------------------
+    conn = sqlite3.connect(prediction_db)
+
+    stored_df = pd.read_sql_query(
+        """
+        SELECT input_text, model_name, prediction
+        FROM predictions
+        """,
+        conn,
+    )
+
+    conn.close()
+
+    assert not stored_df.empty
+    assert len(stored_df) == len(summary_results)
+
+    # ---------------------------------------------------------
+    # 6. Create MLflow experiment
+    # ---------------------------------------------------------
+    mlflow.set_experiment(
+        "summarization-integration-test"
+    )
+
+    # ---------------------------------------------------------
+    # 7. Start REAL MLflow server run
+    # ---------------------------------------------------------
+    with mlflow.start_run(
+        run_name="summarization_sqlite_test"
+    ) as run:
+
+        run_id = run.info.run_id
+
+        # -----------------------------------------------------
+        # 8. Log YOUR actual transformer models
+        # -----------------------------------------------------
+        for model_name, model_pipeline in models.items():
+
+            model_input = pd.DataFrame(
+                {
+                    "text": [combined_text]
+                }
+            )
+
+            # Actual prediction from YOUR model
+            raw_prediction = model_pipeline(
+                combined_text
+            )
+
+            prediction_df = pd.DataFrame(
+                {
+                    "prediction": [
+                        raw_prediction[0]["summary_text"]
+                    ]
+                }
+            )
+
+            # -------------------------------------------------
+            # 9. Create MLflow signature
+            # -------------------------------------------------
+            signature = infer_signature(
+                model_input,
+                prediction_df,
+            )
+
+            # -------------------------------------------------
+            # 10. Log YOUR model using YOUR utility
+            # -------------------------------------------------
+            logged = log_transformer_model(
+                model_name=model_name,
+                model_pipeline=model_pipeline,
+                signature=signature,
+            )
+
+            assert logged is True
+
+            # -------------------------------------------------
+            # 11. Build model URI
+            # -------------------------------------------------
+            model_uri = (
+                f"runs:/{run_id}/{model_name}"
+            )
+
+            # -------------------------------------------------
+            # 12. Load model from MLflow server
+            # -------------------------------------------------
+            loaded_model = mlflow.pyfunc.load_model(
+                model_uri
+            )
+
+            # -------------------------------------------------
+            # 13. Read input back from SQLite
+            # -------------------------------------------------
+            conn = sqlite3.connect(
+                prediction_db
+            )
+
+            sqlite_input = pd.read_sql_query(
+                """
+                SELECT input_text
+                FROM predictions
+                WHERE model_name = ?
+                """,
+                conn,
+                params=(model_name,),
+            )
+
+            conn.close()
+
+            sqlite_input = sqlite_input.rename(
+                columns={
+                    "input_text": "text"
+                }
+            )
+
+            # -------------------------------------------------
+            # 14. Predict using MLflow-loaded model
+            # -------------------------------------------------
+            result = loaded_model.predict(
+                sqlite_input
+            )
+
+            # -------------------------------------------------
+            # 15. Schema assertions
+            # -------------------------------------------------
+            assert isinstance(
+                result,
+                pd.DataFrame,
+            )
+
+            assert list(
+                result.columns
+            ) == ["prediction"]
+
+            assert result[
+                "prediction"
+            ].notna().all()
+
+            assert len(result) == 1
+
+            # -------------------------------------------------
+            # 16. Verify prediction was actually generated
+            # -------------------------------------------------
+            assert isinstance(
+                result.iloc[0]["prediction"],
+                str,
+            )
+One correction to your production utility
+
+Because your current log_transformer_model() accepts only:
+
+model_name,
+model_pipeline
+
+and calls mlflow.transformers.log_model() without signature,
+
+you need the small change I mentioned earlier:
+
+def log_transformer_model(
+    model_name,
+    model_pipeline,
+    signature=None,
+):
+
+and:
+
+mlflow.transformers.log_model(
+    transformers_model=model_pipeline,
+    artifact_path=model_name,
+    signature=signature,
+)
+What this test now proves
+
+This is much closer to the integration test you described:
+
+1. Real summarization
+Uses your run_pipeline() — no fake model.
+
+2. Real SQLite
+Prediction is physically inserted and read from a SQLite DB.
+
+3. Real MLflow server
+The test starts an MLflow server whose tracking backend is SQLite.
+
+4. Real MLflow model logging
+Uses your log_transformer_model().
+
+5. Real model loading
+Uses:
+
+mlflow.pyfunc.load_model(model_uri)
+
+6. Schema
+An MLflow signature is attached and the returned prediction is checked against the expected schema.
+
+One thing I would not put into this test yet is model registration/promotion. Your production pipeline does those separately after model logging and validation.
+
+So this should remain a focused “prediction → SQLite → MLflow model → schema” integration test.
+
+anser i not more than 50 words are we callign configure_mlflow () for registry and all ?
+
+Yes. For the integration test, we should call configure_mlflow() first so the MLflow tracking/server URI and registry configuration are established. Then the test can perform run → model logging → registration → metadata/schema validation using the real MLflow server.
+
+but our we using in code you suggested
+
+No. In the code I suggested, I was setting mlflow.set_tracking_uri() directly inside the fixture, rather than calling your existing configure_mlflow().
