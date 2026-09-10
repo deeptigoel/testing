@@ -1,677 +1,73 @@
-Not quite. test_model_registration_and_provenance() is an integration test, but I would not call it a full E2E test if it only starts with an already-logged model URI and then tests registration.
+# tests/fake_summarizer.py
 
-Your description:
+class FakeTokenizer:
+    def __call__(
+        self,
+        text,
+        truncation=False,
+        max_length=None,
+        add_special_tokens=True,
+    ):
+        # Simple whitespace tokenization
+        tokens = text.split()
 
-Model registration → version → run ID → dataset version → validation status → provenance
+        if truncation and max_length:
+            tokens = tokens[:max_length]
 
-is excellent for a model registration/provenance integration test.
+        return {
+            "input_ids": list(range(len(tokens)))
+        }
 
-A true E2E test should start from the pipeline input and exercise the complete workflow through to the final registered model/model card retrieval.
-
-I would name them like this
-Test	Type	Scope
-test_summarization_model_lifecycle()	Integration	Summarization → model logging/loading
-test_model_registration_and_provenance()	Integration	Registration → version → lineage/provenance
-test_mlflow_promotion()	Integration	Evaluation → promotion decision
-test_model_card_logging_and_retrieval()	Integration	Model card → artifact → retrieval
-test_summarization_pipeline_end_to_end()	E2E	Input → summarization → logging → registration → evaluation → promotion → model card → retrieval
-
-So yes, your proposed test absolutely should exist, and I would keep it. But I would describe it as:
-
-Model registration and provenance validation — verifies registered model version, source run ID, dataset version, validation status, and lineage metadata.
-
-Not as the complete E2E test.
-
-If your goal is to have one test that proves “everything works together,” then the E2E test should call the actual pipeline and then assert the final MLflow state, rather than independently performing each operation itself.
-
-could you give one with test mdel rgsiteration and provennace including modelcard etsting 
-
-Yes. Given your current structure, I would make one focused end-to-end integration test named test_model_registration_and_provenance() and include the model-card lifecycle in it.
-
-That gives you a test whose scope is:
-
-Model logging → registration → version → provenance → evaluation linkage → model card generation → model card artifact logging → model card retrieval → assertions
-
-It is reasonable to call this an E2E model-registration/provenance test, even though it isn't testing every preprocessing/inference step of the pipeline.
-
-Based on the model_card_utils.py and mlflow_utils.py in your folder, I would write it like this:
-
-import json
-
-import mlflow
-import pytest
-
-from mlflow import MlflowClient
-
-from mlflow_utils import (
-    log_transformer_model,
-    register_model,
-)
-
-from model_card_utils import (
-    build_model_card,
-    save_model_card,
-    log_model_card,
-    tag_model_version_with_card,
-)
+    def decode(
+        self,
+        input_ids,
+        skip_special_tokens=True,
+    ):
+        return " ".join(
+            f"token_{i}" for i in input_ids
+        )
 
 
-@pytest.mark.integration
-def test_model_registration_and_provenance(
-    mlflow_server,
-    mlflow_client,
-    local_summarization_model,
-    tmp_path,
-):
-    """
-    End-to-end integration test for model registration,
-    provenance and model-card lifecycle.
+class FakeSummarizationPipeline:
 
-    Flow:
+    def __init__(self):
+        self.tokenizer = FakeTokenizer()
 
-        Model logging
-            ↓
-        Model registration
-            ↓
-        Registered model version
-            ↓
-        Provenance metadata
-            ↓
-        Evaluation child run
-            ↓
-        Model card generation
-            ↓
-        Model card artifact logging
-            ↓
-        Model card metadata on model version
-            ↓
-        Retrieval and validation
-    """
+    def __call__(
+        self,
+        text,
+        max_new_tokens=None,
+        min_length=None,
+        truncation=True,
+        do_sample=False,
+        length_penalty=1.2,
+        early_stopping=True,
+        no_repeat_ngram_size=3,
+        **kwargs,
+    ):
+        words = text.split()
 
-    # ==============================================================
-    # 1. Configure real MLflow server
-    # ==============================================================
+        # Deterministic fake summary
+        summary_length = min(20, len(words))
 
-    mlflow.set_tracking_uri(mlflow_server)
-    mlflow.set_registry_uri(mlflow_server)
+        summary = " ".join(
+            words[:summary_length]
+        )
 
-    mlflow.set_experiment(
-        "model-registration-provenance-e2e"
-    )
-
-    client = MlflowClient(
-        tracking_uri=mlflow_server,
-        registry_uri=mlflow_server,
-    )
-
-    model_name = "test_summarization_model"
-    dataset_version = "test_v1"
-
-    # ==============================================================
-    # 2. Start parent run
-    # ==============================================================
-
-    with mlflow.start_run(
-        run_name="summarization-registration-e2e"
-    ) as parent_run:
-
-        parent_run_id = parent_run.info.run_id
-
-        # ----------------------------------------------------------
-        # Parent-run provenance
-        # ----------------------------------------------------------
-
-        mlflow.set_tags(
+        return [
             {
-                "run_type": "inference",
-                "run_scope": "summarization_pipeline",
-                "capability": "abstractive summarization",
-                "dataset_version": dataset_version,
-                "validation_status": "passed",
-            }
-        )
-
-        mlflow.log_params(
-            {
-                "model_name": model_name,
-                "dataset_version": dataset_version,
-            }
-        )
-
-        # ==========================================================
-        # 3. Log summarization model
-        # ==========================================================
-
-        model_logged = log_transformer_model(
-            model_name=model_name,
-            model_pipeline=local_summarization_model,
-        )
-
-        assert model_logged is True
-
-        # ==========================================================
-        # 4. Verify model artifact was logged
-        # ==========================================================
-
-        artifacts = client.list_artifacts(
-            parent_run_id,
-            path=model_name,
-        )
-
-        assert artifacts, (
-            "Expected logged model artifacts "
-            "were not found."
-        )
-
-        model_uri = (
-            f"runs:/{parent_run_id}/{model_name}"
-        )
-
-        # ==========================================================
-        # 5. Register model
-        # ==========================================================
-
-        registered_info = register_model(
-            model_uri=model_uri,
-            model_name=model_name,
-            description=(
-                "Summarization model used for "
-                "registration E2E integration test"
-            ),
-            run_id=parent_run_id,
-            dataset_version=dataset_version,
-            validation_status="passed",
-            client=client,
-        )
-
-        registered_name = (
-            registered_info["registered_name"]
-        )
-
-        version = str(
-            registered_info["version"]
-        )
-
-        assert registered_name == model_name
-        assert version
-
-        # ==========================================================
-        # 6. Retrieve registered model version
-        # ==========================================================
-
-        registered_version = (
-            client.get_model_version(
-                name=registered_name,
-                version=version,
-            )
-        )
-
-        assert (
-            registered_version.name
-            == registered_name
-        )
-
-        assert (
-            str(registered_version.version)
-            == version
-        )
-
-        # ==========================================================
-        # 7. Verify registration provenance
-        # ==========================================================
-
-        version_tags = registered_version.tags
-
-        assert (
-            version_tags["parent_run_id"]
-            == parent_run_id
-        )
-
-        assert (
-            version_tags["dataset_version"]
-            == dataset_version
-        )
-
-        assert (
-            version_tags["validation_status"]
-            == "passed"
-        )
-
-        # ==========================================================
-        # 8. Create evaluation child run
-        # ==========================================================
-
-        with mlflow.start_run(
-            run_name="Evaluation",
-            nested=True,
-        ) as evaluation_run:
-
-            evaluation_run_id = (
-                evaluation_run.info.run_id
-            )
-
-            assert (
-                evaluation_run.data.tags[
-                    mlflow.parent_run_id
-                ]
-                == parent_run_id
-            )
-
-            # ------------------------------------------------------
-            # Evaluation metrics
-            # ------------------------------------------------------
-
-            evaluation_metrics = {
-                "bert_f1": 0.85,
-                "rougeL": 0.80,
-                "meteor": 0.75,
-                "factual_consistency": 0.90,
-                "composite_score": 0.83,
+                "summary_text": (
+                    f"FAKE SUMMARY: {summary}"
+                )
             }
 
-            mlflow.log_metrics(
-                evaluation_metrics
-            )
 
-            mlflow.set_tags(
-                {
-                    "run_type": "evaluation",
-                    "run_scope": "scoring",
-                    "dataset_version": dataset_version,
-                }
-            )
+@pytest.fixture
+def local_summarization_model():
 
-        # ==========================================================
-        # 9. Add evaluation provenance to model version
-        # ==========================================================
-
-        client.set_model_version_tag(
-            name=registered_name,
-            version=version,
-            key="evaluation_run_id",
-            value=evaluation_run_id,
-        )
-
-        client.set_model_version_tag(
-            name=registered_name,
-            version=version,
-            key="promotion_role",
-            value="champion",
-        )
-
-        client.set_model_version_tag(
-            name=registered_name,
-            version=version,
-            key="composite_score",
-            value="0.83",
-        )
-
-        # ==========================================================
-        # 10. Build model card
-        # ==========================================================
-
-        model_card = build_model_card(
-            model_name=model_name,
-            registered_name=registered_name,
-            model_version=version,
-            parent_run_id=parent_run_id,
-            evaluation_run_id=evaluation_run_id,
-            validation_status="passed",
-            dataset_version=dataset_version,
-            evaluation_metrics=evaluation_metrics,
-            evaluation_params={},
-            promotion_role="Champion",
-            composite_score=0.83,
-        )
-
-        # ==========================================================
-        # 11. Validate model card contents before logging
-        # ==========================================================
-
-        assert (
-            model_card["model"]["name"]
-            == model_name
-        )
-
-        assert (
-            model_card["model"]["registered_name"]
-            == registered_name
-        )
-
-        assert (
-            model_card["model"]["version"]
-            == version
-        )
-
-        assert (
-            model_card["lineage"]["parent_run_id"]
-            == parent_run_id
-        )
-
-        assert (
-            model_card["lineage"]["evaluation_run_id"]
-            == evaluation_run_id
-        )
-
-        assert (
-            model_card["lineage"]["dataset_version"]
-            == dataset_version
-        )
-
-        assert (
-            model_card["validation"]["status"]
-            == "passed"
-        )
-
-        assert (
-            model_card["evaluation"]["metrics"][
-                "composite_score"
-            ]
-            == pytest.approx(0.83)
-        )
-
-        assert (
-            model_card["promotion"]["role"]
-            == "Champion"
-        )
-
-        # ==========================================================
-        # 12. Save model card JSON + Markdown
-        # ==========================================================
-
-        card_paths = save_model_card(
-            model_card,
-            output_dir=str(
-                tmp_path / "model_card"
-            ),
-        )
-
-        assert card_paths["json"]
-        assert card_paths["markdown"]
-
-        # ==========================================================
-        # 13. Log model card to MLflow
-        # ==========================================================
-
-        log_model_card(
-            card_paths,
-            artifact_path="model_card",
-        )
-
-        # ==========================================================
-        # 14. Add model-card metadata to registered version
-        # ==========================================================
-
-        tag_model_version_with_card(
-            client=client,
-            registered_name=registered_name,
-            version=version,
-            model_card_path=(
-                "model_card/model_card.json"
-            ),
-        )
-
-    # ==============================================================
-    # 15. Retrieve parent run
-    # ==============================================================
-
-    retrieved_parent = client.get_run(
-        parent_run_id
+    from fake_summarizer import (
+        FakeSummarizationPipeline
     )
 
-    assert (
-        retrieved_parent.info.status
-        == "FINISHED"
-    )
-
-    assert (
-        retrieved_parent.data.tags[
-            "dataset_version"
+    return FakeSummarizationPipeline()
         ]
-        == dataset_version
-    )
-
-    assert (
-        retrieved_parent.data.tags[
-            "validation_status"
-        ]
-        == "passed"
-    )
-
-    # ==============================================================
-    # 16. Retrieve evaluation run
-    # ==============================================================
-
-    retrieved_evaluation = client.get_run(
-        evaluation_run_id
-    )
-
-    assert (
-        retrieved_evaluation.info.status
-        == "FINISHED"
-    )
-
-    assert (
-        retrieved_evaluation.data.tags[
-            mlflow.parent_run_id
-        ]
-        == parent_run_id
-    )
-
-    assert (
-        retrieved_evaluation.data.metrics[
-            "composite_score"
-        ]
-        == pytest.approx(0.83)
-    )
-
-    # ==============================================================
-    # 17. Retrieve registered model version again
-    # ==============================================================
-
-    final_version = client.get_model_version(
-        name=registered_name,
-        version=version,
-    )
-
-    final_tags = final_version.tags
-
-    # --------------------------------------------------------------
-    # Registration provenance
-    # --------------------------------------------------------------
-
-    assert (
-        final_tags["parent_run_id"]
-        == parent_run_id
-    )
-
-    assert (
-        final_tags["dataset_version"]
-        == dataset_version
-    )
-
-    assert (
-        final_tags["validation_status"]
-        == "passed"
-    )
-
-    # --------------------------------------------------------------
-    # Evaluation provenance
-    # --------------------------------------------------------------
-
-    assert (
-        final_tags["evaluation_run_id"]
-        == evaluation_run_id
-    )
-
-    # --------------------------------------------------------------
-    # Promotion provenance
-    # --------------------------------------------------------------
-
-    assert (
-        final_tags["promotion_role"]
-        == "champion"
-    )
-
-    assert (
-        float(final_tags["composite_score"])
-        == pytest.approx(0.83)
-    )
-
-    # --------------------------------------------------------------
-    # Model-card provenance
-    # --------------------------------------------------------------
-
-    assert (
-        final_tags["model_card_status"]
-        == "generated"
-    )
-
-    assert (
-        final_tags["model_card_path"]
-        == "model_card/model_card.json"
-    )
-
-    # ==============================================================
-    # 18. Verify model-card artifacts exist in MLflow
-    # ==============================================================
-
-    card_artifacts = client.list_artifacts(
-        parent_run_id,
-        path="model_card",
-    )
-
-    artifact_paths = {
-        artifact.path
-        for artifact in card_artifacts
-    }
-
-    assert (
-        "model_card/model_card.json"
-        in artifact_paths
-    )
-
-    assert (
-        "model_card/model_card.md"
-        in artifact_paths
-    )
-
-    # ==============================================================
-    # 19. Retrieve model card from MLflow
-    # ==============================================================
-
-    downloaded_card = client.download_artifacts(
-        parent_run_id,
-        "model_card/model_card.json",
-        dst_path=str(
-            tmp_path / "retrieved_model_card"
-        ),
-    )
-
-    # ==============================================================
-    # 20. Read retrieved model card
-    # ==============================================================
-
-    with open(
-        downloaded_card,
-        "r",
-        encoding="utf-8",
-    ) as file:
-        retrieved_card = json.load(file)
-
-    # ==============================================================
-    # 21. Assert retrieved model card
-    # ==============================================================
-
-    assert (
-        retrieved_card["model"]["name"]
-        == model_name
-    )
-
-    assert (
-        retrieved_card["model"]["registered_name"]
-        == registered_name
-    )
-
-    assert (
-        retrieved_card["model"]["version"]
-        == version
-    )
-
-    assert (
-        retrieved_card["lineage"]["parent_run_id"]
-        == parent_run_id
-    )
-
-    assert (
-        retrieved_card["lineage"]["evaluation_run_id"]
-        == evaluation_run_id
-    )
-
-    assert (
-        retrieved_card["lineage"]["dataset_version"]
-        == dataset_version
-    )
-
-    assert (
-        retrieved_card["validation"]["status"]
-        == "passed"
-    )
-
-    assert (
-        retrieved_card["evaluation"]["metrics"][
-            "bert_f1"
-        ]
-        == pytest.approx(0.85)
-    )
-
-    assert (
-        retrieved_card["evaluation"]["metrics"][
-            "rougeL"
-        ]
-        == pytest.approx(0.80)
-    )
-
-    assert (
-        retrieved_card["evaluation"]["metrics"][
-            "meteor"
-        ]
-        == pytest.approx(0.75)
-    )
-
-    assert (
-        retrieved_card["evaluation"]["metrics"][
-            "factual_consistency"
-        ]
-        == pytest.approx(0.90)
-    )
-
-    assert (
-        retrieved_card["evaluation"]["metrics"][
-            "composite_score"
-        ]
-        == pytest.approx(0.83)
-    )
-
-    assert (
-        retrieved_card["promotion"]["role"]
-        == "Champion"
-    )
-
-    assert (
-        retrieved_card["promotion"]["composite_score"]
-        == pytest.approx(0.83)
-    )
-What this single test covers
-
-So you can describe it in your test documentation as:
-
-test_model_registration_and_provenance() — End-to-end validation of model logging, registration, versioning, run/dataset/validation provenance, evaluation lineage, promotion metadata, model-card generation, MLflow artifact logging, model-card retrieval, and final metadata assertions.
-
-The key distinction is that it doesn't just assert registration. It follows the registered model all the way through its associated evaluation and model card and then retrieves everything back from MLflow.
-
-One adjustment I would make to your actual production code before running this: your current register_model() already writes parent_run_id, dataset_version, and validation_status, while tag_model_version_with_card() writes the model-card tags. So those parts should not be manually duplicated in the test when you're eventually testing the real pipeline. The test should invoke the production functions and then verify what they persisted.
-
-now i will have full end to end and these maller integration tetss - hope am not dupliacting anythign and it is good idea to buikd these -- answer in notmore than 50 words
-
-Yes. This is a good testing strategy. The smaller integration tests validate individual boundaries/components, while the E2E test validates the complete workflow. Some assertions will naturally overlap, but that is useful: focused tests diagnose failures; E2E proves everything works together.
