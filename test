@@ -1,73 +1,364 @@
-# tests/fake_summarizer.py
+# create_tiny_bart_model.py
 
-class FakeTokenizer:
-    def __call__(
-        self,
-        text,
-        truncation=False,
-        max_length=None,
-        add_special_tokens=True,
-    ):
-        # Simple whitespace tokenization
-        tokens = text.split()
+from pathlib import Path
 
-        if truncation and max_length:
-            tokens = tokens[:max_length]
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from tokenizers.pre_tokenizers import Whitespace
 
-        return {
-            "input_ids": list(range(len(tokens)))
-        }
+from transformers import (
+    BartConfig,
+    BartForConditionalGeneration,
+    PreTrainedTokenizerFast,
+)
 
-    def decode(
-        self,
-        input_ids,
-        skip_special_tokens=True,
-    ):
-        return " ".join(
-            f"token_{i}" for i in input_ids
+
+# =========================================================
+# Configuration
+# =========================================================
+
+MODEL_DIR = (
+    Path(__file__).resolve().parent
+    / "models"
+    / "tiny-bart-summarizer"
+)
+
+
+# =========================================================
+# 1. Create tiny tokenizer
+# =========================================================
+
+def create_tokenizer():
+
+    # -----------------------------------------------------
+    # Very small vocabulary.
+    #
+    # This tokenizer is ONLY for integration testing.
+    # -----------------------------------------------------
+
+    words = [
+        "<pad>",
+        "<s>",
+        "</s>",
+        "<unk>",
+
+        "the",
+        "a",
+        "an",
+        "this",
+        "is",
+        "sample",
+        "document",
+        "text",
+        "used",
+        "to",
+        "validate",
+        "the",
+        "summarization",
+        "pipeline",
+        "test",
+        "data",
+        "model",
+        "summary",
+        "information",
+        "patient",
+        "health",
+        "clinical",
+        "research",
+        "study",
+        "treatment",
+        "disease",
+        "drug",
+        "vaccine",
+        "oncology",
+        "respiratory",
+        "important",
+        "result",
+        "analysis",
+        "medical",
+        "therapy",
+        "condition",
+        "response",
+        "note",
+        "provider",
+        "physician",
+        "hcp",
+        "msl",
+        "call",
+        "outcome",
+        "generated",
+    ]
+
+    # Remove duplicates while preserving order
+    words = list(dict.fromkeys(words))
+
+    vocab = {
+        word: index
+        for index, word in enumerate(words)
+    }
+
+    tokenizer = Tokenizer(
+        WordLevel(
+            vocab=vocab,
+            unk_token="<unk>",
+        )
+    )
+
+    tokenizer.pre_tokenizer = Whitespace()
+
+    hf_tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=tokenizer,
+
+        bos_token="<s>",
+        eos_token="</s>",
+        unk_token="<unk>",
+        pad_token="<pad>",
+    )
+
+    return hf_tokenizer
+
+
+# =========================================================
+# 2. Create tiny BART model
+# =========================================================
+
+def create_model(tokenizer):
+
+    config = BartConfig(
+
+        # -------------------------------------------------
+        # Vocabulary
+        # -------------------------------------------------
+
+        vocab_size=tokenizer.vocab_size,
+
+        # -------------------------------------------------
+        # Tiny BART architecture
+        # -------------------------------------------------
+
+        d_model=32,
+
+        encoder_layers=1,
+        decoder_layers=1,
+
+        encoder_attention_heads=2,
+        decoder_attention_heads=2,
+
+        encoder_ffn_dim=64,
+        decoder_ffn_dim=64,
+
+        # -------------------------------------------------
+        # Token IDs
+        # -------------------------------------------------
+
+        pad_token_id=tokenizer.pad_token_id,
+        bos_token_id=tokenizer.bos_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+
+        decoder_start_token_id=tokenizer.pad_token_id,
+
+        # -------------------------------------------------
+        # Disable dropout for deterministic testing
+        # -------------------------------------------------
+
+        dropout=0.0,
+        attention_dropout=0.0,
+        activation_dropout=0.0,
+
+        # -------------------------------------------------
+        # Small positional embeddings
+        # -------------------------------------------------
+
+        max_position_embeddings=512,
+
+        # -------------------------------------------------
+        # No forced BOS
+        # -------------------------------------------------
+
+        forced_bos_token_id=None,
+        forced_eos_token_id=None,
+    )
+
+    model = BartForConditionalGeneration(config)
+
+    return model
+
+
+# =========================================================
+# 3. Main
+# =========================================================
+
+def main():
+
+    MODEL_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    print("=" * 60)
+    print("Creating tiny BART test model")
+    print("=" * 60)
+
+    # -----------------------------------------------------
+    # Tokenizer
+    # -----------------------------------------------------
+
+    print("\nCreating tokenizer...")
+
+    tokenizer = create_tokenizer()
+
+    print(
+        f"Vocabulary size: {tokenizer.vocab_size}"
+    )
+
+    # -----------------------------------------------------
+    # Model
+    # -----------------------------------------------------
+
+    print("\nCreating BART model...")
+
+    model = create_model(tokenizer)
+
+    total_parameters = sum(
+        parameter.numel()
+        for parameter in model.parameters()
+    )
+
+    print(
+        f"Model parameters: {total_parameters:,}"
+    )
+
+    # -----------------------------------------------------
+    # Save model
+    # -----------------------------------------------------
+
+    print("\nSaving model...")
+
+    model.save_pretrained(
+        MODEL_DIR,
+        safe_serialization=True,
+    )
+
+    # -----------------------------------------------------
+    # Save tokenizer
+    # -----------------------------------------------------
+
+    print("Saving tokenizer...")
+
+    tokenizer.save_pretrained(
+        MODEL_DIR
+    )
+
+    # -----------------------------------------------------
+    # Test local loading
+    # -----------------------------------------------------
+
+    print("\nTesting local reload...")
+
+    from transformers import (
+        AutoTokenizer,
+        AutoModelForSeq2SeqLM,
+    )
+
+    loaded_tokenizer = AutoTokenizer.from_pretrained(
+        str(MODEL_DIR),
+        local_files_only=True,
+    )
+
+    loaded_model = AutoModelForSeq2SeqLM.from_pretrained(
+        str(MODEL_DIR),
+        local_files_only=True,
+    )
+
+    print(
+        "Reload successful."
+    )
+
+    # -----------------------------------------------------
+    # Test tokenizer
+    # -----------------------------------------------------
+
+    test_text = (
+        "This is a sample document "
+        "used to validate the summarization pipeline."
+    )
+
+    encoded = loaded_tokenizer(
+        test_text
+    )
+
+    print(
+        f"Test input tokens: "
+        f"{len(encoded['input_ids'])}"
+    )
+
+    # -----------------------------------------------------
+    # Final
+    # -----------------------------------------------------
+
+    print("\n" + "=" * 60)
+    print("Tiny BART model created successfully")
+    print("=" * 60)
+
+    print(
+        f"\nLocation:\n{MODEL_DIR}"
+    )
+
+    print(
+        "\nFiles:"
+    )
+
+    for file in sorted(MODEL_DIR.iterdir()):
+        print(
+            f"  {file.name:<30} "
+            f"{file.stat().st_size:,} bytes"
         )
 
 
-class FakeSummarizationPipeline:
+if __name__ == "__main__":
+    main()
 
-    def __init__(self):
-        self.tokenizer = FakeTokenizer()
 
-    def __call__(
-        self,
-        text,
-        max_new_tokens=None,
-        min_length=None,
-        truncation=True,
-        do_sample=False,
-        length_penalty=1.2,
-        early_stopping=True,
-        no_repeat_ngram_size=3,
-        **kwargs,
-    ):
-        words = text.split()
-
-        # Deterministic fake summary
-        summary_length = min(20, len(words))
-
-        summary = " ".join(
-            words[:summary_length]
-        )
-
-        return [
-            {
-                "summary_text": (
-                    f"FAKE SUMMARY: {summary}"
-                )
-            }
-
+########
 
 @pytest.fixture
 def local_summarization_model():
 
-    from fake_summarizer import (
-        FakeSummarizationPipeline
+    from pathlib import Path
+
+    from transformers import (
+        AutoTokenizer,
+        AutoModelForSeq2SeqLM,
+        pipeline,
     )
 
-    return FakeSummarizationPipeline()
-        ]
+    model_path = (
+        Path(__file__).resolve().parent.parent
+        / "03_models"
+        / "02_evaluate"
+        / "models"
+        / "tiny-bart-summarizer"
+    ).resolve()
+
+    assert model_path.exists(), (
+        f"Model path does not exist: {model_path}"
+    )
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        str(model_path),
+        local_files_only=True,
+    )
+
+    model = AutoModelForSeq2SeqLM.from_pretrained(
+        str(model_path),
+        local_files_only=True,
+    )
+
+    model_pipeline = pipeline(
+        "summarization",
+        model=model,
+        tokenizer=tokenizer,
+    )
+
+    return model_pipeline
+
