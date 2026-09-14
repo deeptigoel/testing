@@ -748,6 +748,11 @@ This separation is intended to provide focused failure identification at the int
 * All added/updated pytest test cases have been executed successfully.
 * Existing test cases were also validated to ensure there are no regressions.
 
+Lightweight Test Model Setup
+Created a small script to generate/load a lightweight model for integration testing, similar to the Hugging Face model flow used by the application.
+This provides a lightweight and controlled model setup for local integration testing without depending on the Databricks workspace/Unity Catalog model.
+For system testing, the actual model will be retrieved from the Databricks workspace/Unity Catalog once the required environment connectivity/setup is available.
+
 
 ntegration coverage has been split into four scenario-based test cases, with a separate end-to-end system test planned to validate the complete workflow.”
   The integration tests cover the identified scenarios individually, while the complete end-to-end system test will validate the overall workflow. Any scenarios or interactions not covered by the integration tests will be additionally validated during system testing to ensure comprehensive coverage.
