@@ -28,6 +28,7 @@ NOTE:
 import mlflow
 import pandas as pd
 import pytest
+from mlflow.models import infer_signature, set_signature, get_model_info
 
 import mlflow_utils
 import summarizer
@@ -226,11 +227,30 @@ def test_end_to_end_register_evaluate_promote_model_card(
                 f"runs:/{run_id}/{model_name}"
             )
 
-            # NOTE: dropped the immediate reload-after-log that was here.
-            # Reloading a full real checkpoint straight after logging it
-            # doubles the save/upload/download cost per alias and is why
-            # this step can appear to hang. Step 8 already reloads from
-            # the registry, which is the read-back that actually matters.
+            # summarization_input (from conftest) is the input example
+            # this model was actually run against — infer + attach its
+            # signature so it's captured on the logged model artifact.
+            # This mirrors the infer_signature(model_input, model_output)
+            # block commented out in test_summarization.py, which notes
+            # log_transformer_model() doesn't currently accept a
+            # signature argument, so it's attached post-log instead.
+
+            model_input_example = pd.DataFrame(
+                {"text": [summarization_input]}
+            )
+
+            raw_prediction = model_pipeline(summarization_input)
+
+            model_output_example = pd.DataFrame(
+                {"prediction": [raw_prediction[0]["summary_text"]]}
+            )
+
+            signature = infer_signature(
+                model_input_example,
+                model_output_example,
+            )
+
+            set_signature(model_uri, signature)
 
             # -----------------------------------------
             # 4b. Register
@@ -511,6 +531,9 @@ def test_end_to_end_register_evaluate_promote_model_card(
         ) == "model_card/model_card.json"
 
         model_uri = f"models:/{registered_name}/{version}"
+
+        model_info = get_model_info(model_uri)
+        assert model_info.signature is not None
 
         reloaded_model = mlflow.transformers.load_model(model_uri)
 
