@@ -10,20 +10,51 @@ This test intentionally reuses the same fixtures and variable names as:
                                eval_df_composite, promotion_info,
                                champion/challenger tags & metrics)
 
-It walks the full pipeline end to end:
-    load model -> log model -> register model -> evaluate ->
-    decide promotion (champion/challenger) -> tag model versions ->
-    build + log model card -> read everything back from the
-    registered model.
+and mirrors every logging/tagging call made by mlflow_pipeline_ipynb.py:
+    set_run_tags, log_environment, log_parameters, set_source_lineage_tags,
+    mlflow.data.from_pandas + log_input, log_artifact(s), update_run_tags,
+    log_transformer_model, register_model, log_model_card,
+    get_incumbent_champion_score, calculate_composite_score,
+    prepare_promotion_metadata, log_metrics, build_model_card,
+    save_model_card, tag_model_version_with_card.
 
-NOTE:
-    build_model_card / save_model_card / log_model_card /
-    tag_model_version_with_card are referenced by mlflow_pipeline_ipynb.py
-    but their source module wasn't provided alongside the other files.
-    They're imported here from `model_card_utils`, matching the naming
-    convention of `mlflow_utils` / `promotion_utils`. Update the import
-    below if they actually live elsewhere in your project.
+NOTES ON DEVIATIONS FROM THE PIPELINE SCRIPT (flagged, not silently fixed):
+
+1. set_run_tags() in the pipeline is called with description=/product=/
+   run_scope=/run_id= kwargs that don't exist on the real
+   mlflow_utils.set_run_tags(run_type, capability, dataset_version, git_sha).
+   That call would raise TypeError as written in the notebook - here we call
+   it with the signature that actually exists in mlflow_utils.py.
+
+2. build_model_card / save_model_card / log_model_card /
+   tag_model_version_with_card aren't defined in any uploaded file. They're
+   imported here from `model_card_utils`, matching the mlflow_utils /
+   promotion_utils naming convention - update the import if they live
+   elsewhere. `log_model_card` is also used for the pre-evaluation static
+   card step, matching how the pipeline calls it with a single path there
+   vs. a list of paths later.
+
+3. validate_model() and log_model_artifact() aren't defined anywhere either.
+   validate_model's result is stood in for with validation_status=True
+   (tagged accordingly); log_model_artifact(MODEL_OUTPUT_DIR) is skipped
+   since there's no equivalent local directory in this test's scope.
+
+4. PRODUCT_NAME / chunk_size / batch_size / max_length / min_tokens aren't
+   in any provided config.py, so test-local values are used, taken directly
+   from summarize.py's own defaults (chunk_text's max_tokens_for_chunking,
+   recursive_reduce's batch_size, summarize()'s max_new_tokens/min_length).
+
+5. get_incumbent_champion_score() is defined locally inside
+   mlflow_pipeline_ipynb.py (not importable from a module), so it's
+   reproduced verbatim below rather than imported.
+
+6. summarizer.temp_load_models is NOT monkeypatched - summarize.py defines
+   and calls its own local temp_load_models(), so the patch target is
+   summarize.temp_load_models (see prior conversation - test_summarization.py
+   has the same bug patching the wrong module).
 """
+
+import time
 
 import mlflow
 import pandas as pd
@@ -31,7 +62,6 @@ import pytest
 from mlflow.models import infer_signature, set_signature, get_model_info
 
 import mlflow_utils
-import summarizer
 import summarize
 from promotion_utils import calculate_composite_score, prepare_promotion_metadata
 from model_card_utils import (
@@ -40,6 +70,36 @@ from model_card_utils import (
     log_model_card,
     tag_model_version_with_card,
 )
+
+
+def get_incumbent_champion_score(client, registered_names):
+    """
+    Reproduced verbatim from mlflow_pipeline_ipynb.py, since it's defined
+    locally there rather than in an importable module.
+    """
+    best = None
+
+    for registered_name in set(registered_names):
+        for version in client.search_model_versions(
+            f"name='{registered_name}'"
+        ):
+            if version.tags.get("promotion_role") != "champion":
+                continue
+
+            raw_score = version.tags.get("composite_score")
+
+            if raw_score is None:
+                continue
+
+            try:
+                score = float(raw_score)
+            except (TypeError, ValueError):
+                continue
+
+            if best is None or score > best:
+                best = score
+
+    return best
 
 
 @pytest.mark.integration
@@ -59,6 +119,8 @@ def test_end_to_end_register_evaluate_promote_model_card(
     model-version tagging -> model card creation ->
     read-back from the registered model.
     """
+
+    start_time = time.time()
 
     # ---------------------------------------------------------
     # 1. Configure MLflow for the integration-test environment
@@ -91,7 +153,7 @@ def test_end_to_end_register_evaluate_promote_model_card(
     # ---------------------------------------------------------
 
     monkeypatch.setattr(
-        summarizer,
+        summarize,
         "temp_load_models",
         lambda: {
             "distilbart_cnn_6_6": local_summarization_model,
@@ -116,6 +178,14 @@ def test_end_to_end_register_evaluate_promote_model_card(
 
     dataset_version = "test-dataset-v1"
 
+    # Test-local stand-ins for config.py values not in any uploaded file,
+    # taken from summarize.py's own defaults.
+    PRODUCT_NAME = "test-product"
+    CHUNK_SIZE = 600     # chunk_text()'s max_tokens_for_chunking default
+    BATCH_SIZE = 3        # recursive_reduce()'s batch_size default
+    MAX_LENGTH = 400      # summarize()'s final max_new_tokens
+    MIN_TOKENS = 40        # summarize()'s min_length floor
+
     # ---------------------------------------------------------
     # 3a. Prepare artifacts, mirroring mlflow_pipeline_ipynb.py:
     #       - df logged as an MLflow *dataset* (mlflow.data.from_pandas +
@@ -126,6 +196,8 @@ def test_end_to_end_register_evaluate_promote_model_card(
     #         mirroring save_summary(df, summary_results, output_file)
     #       - a synthetic groundtruth folder (mirrors
     #         ground_truth/<product>/*.xlsx from evaluation.py)
+    #       - a placeholder "existing" model card file, for the
+    #         pre-evaluation log_model_card(MODEL_CARD_FILE) step
     # ---------------------------------------------------------
 
     input_text_path = tmp_path / "input.txt"
@@ -151,6 +223,11 @@ def test_end_to_end_register_evaluate_promote_model_card(
     groundtruth_dir.mkdir()
     (groundtruth_dir / "reference.txt").write_text(summarization_input)
 
+    existing_model_card_path = tmp_path / "existing_model_card.md"
+    existing_model_card_path.write_text(
+        "# Model Card (placeholder, pre-evaluation)\n"
+    )
+
     # ---------------------------------------------------------
     # 4. Parent MLflow run: log, validate, and register every model
     # ---------------------------------------------------------
@@ -164,6 +241,35 @@ def test_end_to_end_register_evaluate_promote_model_card(
         run_id = run.info.run_id
         parent_run_id = run_id
 
+        # -----------------------------------------
+        # 4a. Run tags, environment, parameters, source lineage
+        # (mlflow_utils.set_run_tags' real signature only takes
+        # run_type/capability/dataset_version/git_sha)
+        # -----------------------------------------
+
+        mlflow_utils.set_run_tags(
+            run_type="inference",
+            capability="abstractive summarization",
+            dataset_version=dataset_version,
+            git_sha="test-git-sha",
+        )
+
+        mlflow_utils.log_environment()
+
+        mlflow_utils.log_parameters(
+            {
+                "chunk_size": CHUNK_SIZE,
+                "batch_size": BATCH_SIZE,
+                "max_length": MAX_LENGTH,
+                "min_tokens": MIN_TOKENS,
+            }
+        )
+
+        mlflow_utils.set_source_lineage_tags(
+            source_file_type="txt",
+            source_path=str(input_text_path),
+        )
+
         mlflow.log_param(
             "input_source",
             "sqlite",
@@ -175,9 +281,7 @@ def test_end_to_end_register_evaluate_promote_model_card(
         )
 
         # -----------------------------------------
-        # 4a-artifacts. Input dataset lineage + raw
-        # source file (matches mlflow.data.from_pandas
-        # + mlflow.log_input + log_artifact(..., "input"))
+        # 4b. Input dataset lineage + raw source file
         # -----------------------------------------
 
         mlflow.log_input(
@@ -190,27 +294,31 @@ def test_end_to_end_register_evaluate_promote_model_card(
             artifact_path="input",
         )
 
-        # NOTE: model_name / number_of_model tags, via your real
-        # update_run_tags() helper in mlflow_utils.py.
         mlflow_utils.update_run_tags(
             model_name=",".join(models.keys()),
             number_of_model=str(len(models)),
         )
 
         # -----------------------------------------
-        # 4a-artifacts. Summary output (df + summary_results
-        # merged), logged at the artifact root - no artifact_path,
-        # matching save_summary(df, summary_results, output_file)
+        # 4c. Summary output (df + summary_results merged), logged
+        # at the artifact root - matches
+        # save_summary(df, summary_results, output_file) + log_artifact(output_file)
         # -----------------------------------------
 
         mlflow_utils.log_artifact(
             str(summary_output_path),
         )
 
+        # -----------------------------------------
+        # 4d. Pre-evaluation "existing model card" step
+        # -----------------------------------------
+
+        log_model_card(str(existing_model_card_path))
+
         for model_name, model_pipeline in models.items():
 
             # -----------------------------------------
-            # 4a. Log
+            # 4e. Log
             # -----------------------------------------
 
             assert mlflow_utils.log_transformer_model(
@@ -223,13 +331,8 @@ def test_end_to_end_register_evaluate_promote_model_card(
             )
 
             # summarization_input (from conftest) is the input example
-            # this model was actually run against — infer + attach its
+            # this model was actually run against - infer + attach its
             # signature so it's captured on the logged model artifact.
-            # This mirrors the infer_signature(model_input, model_output)
-            # block commented out in test_summarization.py, which notes
-            # log_transformer_model() doesn't currently accept a
-            # signature argument, so it's attached post-log instead.
-
             model_input_example = pd.DataFrame(
                 {"text": [summarization_input]}
             )
@@ -247,8 +350,16 @@ def test_end_to_end_register_evaluate_promote_model_card(
 
             set_signature(model_uri, signature)
 
+            validation_status = True  # validate_model() isn't provided
+
+            mlflow_utils.update_run_tags(
+                validation_status=(
+                    "passed" if validation_status else "failed"
+                ),
+            )
+
             # -----------------------------------------
-            # 4b. Register
+            # 4f. Register
             # -----------------------------------------
 
             registered_info = mlflow_utils.register_model(
@@ -257,12 +368,16 @@ def test_end_to_end_register_evaluate_promote_model_card(
                 description="Abstractive summarization model",
                 run_id=parent_run_id,
                 dataset_version=dataset_version,
-                validation_status=True,
+                validation_status=validation_status,
                 client=mlflow_client,
             )
 
             assert registered_info["registered_name"]
             assert registered_info["version"]
+
+            mlflow_utils.update_run_tags(
+                registration_status="registered",
+            )
 
             registered_models.append(
                 {
@@ -291,8 +406,19 @@ def test_end_to_end_register_evaluate_promote_model_card(
                 == parent_run_id
             )
 
+            mlflow_utils.set_run_tags(
+                run_type="evaluation",
+                capability="abstractive summarization evaluation",
+                dataset_version=dataset_version,
+                git_sha="test-git-sha",
+            )
+
+            mlflow_utils.update_run_tags(
+                evaluation_run_id=child_run_id,
+            )
+
             # -----------------------------------------
-            # 5a-artifacts. Groundtruth used for evaluation
+            # 5a. Groundtruth used for evaluation
             # -----------------------------------------
 
             mlflow_utils.log_artifacts(
@@ -319,7 +445,7 @@ def test_end_to_end_register_evaluate_promote_model_card(
             assert "composite" in eval_df_composite.columns
 
             # -----------------------------------------
-            # 5b-artifacts. Evaluation results
+            # 5b. Evaluation results artifact
             # -----------------------------------------
 
             eval_output_path = tmp_path / "evaluation_results.csv"
@@ -330,24 +456,43 @@ def test_end_to_end_register_evaluate_promote_model_card(
                 artifact_path="eval_output",
             )
 
-            # NOTE: log_eval_quality_tags() still isn't in any uploaded
-            # file, so quality-label columns go through update_run_tags()
-            # directly - it already skips None values for us.
-            eval_quality_params = {
-                key: str(value)
-                for key, value in eval_df_composite.iloc[0].to_dict().items()
-                if not isinstance(value, (int, float))
-            }
+            # -----------------------------------------
+            # 5c. Composite-score row -> numeric metrics + string tags,
+            # matching the metrics/params split around
+            # log_metrics(metrics) + log_eval_quality_tags(params)
+            # -----------------------------------------
+
+            composite_row = eval_df_composite.iloc[0].to_dict()
+
+            eval_run_metrics = {}
+            eval_quality_params = {}
+
+            for key, value in composite_row.items():
+                if isinstance(value, (int, float)):
+                    eval_run_metrics[key] = float(value)
+                else:
+                    eval_quality_params[key] = str(value)
+
+            if eval_run_metrics:
+                mlflow_utils.log_metrics(eval_run_metrics)
 
             if eval_quality_params:
                 mlflow_utils.update_run_tags(**eval_quality_params)
 
             mlflow_utils.update_run_tags(evaluation_status="complete")
 
-            # Prepare promotion metadata
+            # Prepare promotion metadata - incumbent champion score is
+            # computed for real (not hardcoded None); on this first run
+            # it resolves to None since no version is tagged
+            # promotion_role="champion" yet.
+            incumbent_score = get_incumbent_champion_score(
+                mlflow_client,
+                [m["registered_name"] for m in registered_models],
+            )
+
             promotion_info = prepare_promotion_metadata(
                 eval_df_composite,
-                incumbent_champion_score=None,
+                incumbent_champion_score=incumbent_score,
             )
 
             assert promotion_info["promotion_status"] == "Completed"
@@ -472,9 +617,29 @@ def test_end_to_end_register_evaluate_promote_model_card(
             assert "challenger_model" not in parent_run_tags
             assert "promotion_status" not in parent_run_tags
 
+        # ---------------------------------------------------------
+        # 8. Final pipeline status
+        # ---------------------------------------------------------
+
+        execution_time = time.time() - start_time
+
+        mlflow_utils.log_metrics(
+            {"execution_time_seconds": execution_time}
+        )
+
+        mlflow_utils.update_run_tags(pipeline_status="completed")
+
     # ---------------------------------------------------------
-    # 8. Read everything back: run artifacts + registered model
+    # 9. Read everything back: run tags/artifacts + registered model
     # ---------------------------------------------------------
+
+    retrieved_parent_run = mlflow_client.get_run(parent_run_id)
+    parent_tags = retrieved_parent_run.data.tags
+
+    assert parent_tags["run_type"] == "inference"
+    assert parent_tags["pipeline_status"] == "completed"
+    assert parent_tags["registration_status"] == "registered"
+    assert parent_tags["validation_status"] == "passed"
 
     parent_artifact_paths = {
         artifact.path
@@ -484,13 +649,19 @@ def test_end_to_end_register_evaluate_promote_model_card(
     assert "input" in parent_artifact_paths
     assert "summary_output.csv" in parent_artifact_paths
 
-    retrieved_parent_run = mlflow_client.get_run(parent_run_id)
     logged_dataset_names = {
         dataset_input.dataset.name
         for dataset_input in retrieved_parent_run.inputs.dataset_inputs
     }
 
     assert "summarization_input" in logged_dataset_names
+
+    retrieved_evaluation_run = mlflow_client.get_run(child_run_id)
+    evaluation_tags = retrieved_evaluation_run.data.tags
+
+    assert evaluation_tags["run_type"] == "evaluation"
+    assert evaluation_tags["evaluation_status"] == "complete"
+    assert evaluation_tags["evaluation_run_id"] == child_run_id
 
     child_artifact_paths = {
         artifact.path
