@@ -25,8 +25,6 @@ NOTE:
     below if they actually live elsewhere in your project.
 """
 
-import json
-
 import mlflow
 import pandas as pd
 import pytest
@@ -118,16 +116,35 @@ def test_end_to_end_register_evaluate_promote_model_card(
     dataset_version = "test-dataset-v1"
 
     # ---------------------------------------------------------
-    # 3a. Prepare artifacts to be logged: input text, summary
-    #     results, and a synthetic groundtruth folder (mirrors
-    #     the ground_truth/<product>/*.xlsx layout in evaluation.py)
+    # 3a. Prepare artifacts, mirroring mlflow_pipeline_ipynb.py:
+    #       - df logged as an MLflow *dataset* (mlflow.data.from_pandas +
+    #         mlflow.log_input), not just a plain text file
+    #       - the raw source file also logged as a file artifact
+    #       - summary output merges df + summary_results into one
+    #         file, logged at the artifact root (no artifact_path),
+    #         mirroring save_summary(df, summary_results, output_file)
+    #       - a synthetic groundtruth folder (mirrors
+    #         ground_truth/<product>/*.xlsx from evaluation.py)
     # ---------------------------------------------------------
 
     input_text_path = tmp_path / "input.txt"
     input_text_path.write_text(summarization_input)
 
-    summary_output_path = tmp_path / "summary_results.json"
-    summary_output_path.write_text(json.dumps(summary_results, indent=2))
+    df = pd.DataFrame({"text": [summarization_input]})
+
+    input_dataset = mlflow.data.from_pandas(
+        df,
+        source=str(input_text_path),
+        name="summarization_input",
+    )
+
+    output_df = df.copy()
+
+    for model_name, summary in summary_results.items():
+        output_df[f"summary_{model_name}"] = summary
+
+    summary_output_path = tmp_path / "summary_output.csv"
+    output_df.to_csv(summary_output_path, index=False)
 
     groundtruth_dir = tmp_path / "groundtruth"
     groundtruth_dir.mkdir()
@@ -157,17 +174,41 @@ def test_end_to_end_register_evaluate_promote_model_card(
         )
 
         # -----------------------------------------
-        # 4a-artifacts. Input + summary output
+        # 4a-artifacts. Input dataset lineage + raw
+        # source file (matches mlflow.data.from_pandas
+        # + mlflow.log_input + log_artifact(..., "input"))
         # -----------------------------------------
+
+        mlflow.log_input(
+            input_dataset,
+            context="inference",
+        )
 
         mlflow_utils.log_artifact(
             str(input_text_path),
             artifact_path="input",
         )
 
+        # NOTE: update_run_tags() isn't in any uploaded file, so these
+        # are set directly via mlflow.set_tag to reproduce the same
+        # model_name / number_of_model tags the pipeline sets.
+        mlflow.set_tag(
+            "model_name",
+            ",".join(models.keys()),
+        )
+        mlflow.set_tag(
+            "number_of_model",
+            str(len(models)),
+        )
+
+        # -----------------------------------------
+        # 4a-artifacts. Summary output (df + summary_results
+        # merged), logged at the artifact root - no artifact_path,
+        # matching save_summary(df, summary_results, output_file)
+        # -----------------------------------------
+
         mlflow_utils.log_artifact(
             str(summary_output_path),
-            artifact_path="summary_output",
         )
 
         for model_name, model_pipeline in models.items():
@@ -273,6 +314,21 @@ def test_end_to_end_register_evaluate_promote_model_card(
                 str(eval_output_path),
                 artifact_path="eval_output",
             )
+
+            # NOTE: log_eval_quality_tags() / update_run_tags() aren't in
+            # any uploaded file. Reproducing their effect directly: any
+            # non-numeric composite-score column becomes a run tag, and
+            # we mark the evaluation run's status like the pipeline does.
+            eval_quality_params = {
+                key: str(value)
+                for key, value in eval_df_composite.iloc[0].to_dict().items()
+                if not isinstance(value, (int, float))
+            }
+
+            if eval_quality_params:
+                mlflow.set_tags(eval_quality_params)
+
+            mlflow.set_tag("evaluation_status", "complete")
 
             # Prepare promotion metadata
             promotion_info = prepare_promotion_metadata(
@@ -419,7 +475,15 @@ def test_end_to_end_register_evaluate_promote_model_card(
     }
 
     assert "input" in parent_artifact_paths
-    assert "summary_output" in parent_artifact_paths
+    assert "summary_output.csv" in parent_artifact_paths
+
+    retrieved_parent_run = mlflow_client.get_run(parent_run_id)
+    logged_dataset_names = {
+        dataset_input.dataset.name
+        for dataset_input in retrieved_parent_run.inputs.dataset_inputs
+    }
+
+    assert "summarization_input" in logged_dataset_names
 
     child_artifact_paths = {
         artifact.path
