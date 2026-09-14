@@ -190,16 +190,11 @@ def test_end_to_end_register_evaluate_promote_model_card(
             artifact_path="input",
         )
 
-        # NOTE: update_run_tags() isn't in any uploaded file, so these
-        # are set directly via mlflow.set_tag to reproduce the same
-        # model_name / number_of_model tags the pipeline sets.
-        mlflow.set_tag(
-            "model_name",
-            ",".join(models.keys()),
-        )
-        mlflow.set_tag(
-            "number_of_model",
-            str(len(models)),
+        # NOTE: model_name / number_of_model tags, via your real
+        # update_run_tags() helper in mlflow_utils.py.
+        mlflow_utils.update_run_tags(
+            model_name=",".join(models.keys()),
+            number_of_model=str(len(models)),
         )
 
         # -----------------------------------------
@@ -335,10 +330,9 @@ def test_end_to_end_register_evaluate_promote_model_card(
                 artifact_path="eval_output",
             )
 
-            # NOTE: log_eval_quality_tags() / update_run_tags() aren't in
-            # any uploaded file. Reproducing their effect directly: any
-            # non-numeric composite-score column becomes a run tag, and
-            # we mark the evaluation run's status like the pipeline does.
+            # NOTE: log_eval_quality_tags() still isn't in any uploaded
+            # file, so quality-label columns go through update_run_tags()
+            # directly - it already skips None values for us.
             eval_quality_params = {
                 key: str(value)
                 for key, value in eval_df_composite.iloc[0].to_dict().items()
@@ -346,9 +340,9 @@ def test_end_to_end_register_evaluate_promote_model_card(
             }
 
             if eval_quality_params:
-                mlflow.set_tags(eval_quality_params)
+                mlflow_utils.update_run_tags(**eval_quality_params)
 
-            mlflow.set_tag("evaluation_status", "complete")
+            mlflow_utils.update_run_tags(evaluation_status="complete")
 
             # Prepare promotion metadata
             promotion_info = prepare_promotion_metadata(
@@ -361,17 +355,10 @@ def test_end_to_end_register_evaluate_promote_model_card(
             assert promotion_info["challenger_model_name"] in model_names
 
             # Log promotion metadata to evaluation run
-            mlflow.set_tag(
-                "champion_model",
-                promotion_info["champion_model_name"],
-            )
-            mlflow.set_tag(
-                "challenger_model",
-                promotion_info["challenger_model_name"],
-            )
-            mlflow.set_tag(
-                "promotion_status",
-                promotion_info["promotion_status"],
+            mlflow_utils.update_run_tags(
+                champion_model=promotion_info["champion_model_name"],
+                challenger_model=promotion_info["challenger_model_name"],
+                promotion_status=promotion_info["promotion_status"],
             )
 
             mlflow.log_metric(
