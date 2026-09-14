@@ -703,3 +703,51 @@ def test_end_to_end_register_evaluate_promote_model_card(
 
         assert result is not None
         assert len(result) == len(texts)
+
+
+
+
+######
+## Summary
+
+This PR includes the following updates to improve test coverage for the MLflow summarization workflow:
+
+### 1. Resolved issues from the previous PR
+
+* Addressed the 4 issues identified during the review of the previous PR.
+* Incorporated the required changes and updated the relevant test/code accordingly.
+
+### 2. Added unit test cases
+
+* Added/updated unit test cases for the relevant utility and workflow functions.
+* Covered different input and validation scenarios to ensure the individual functions behave as expected.
+
+### 3. Added integration test cases
+
+* Added 4 integration test cases covering different scenarios across the MLflow workflow.
+* Instead of having one large integration test covering the complete flow, the scenarios have been split into separate test cases to provide better coverage and make individual failures easier to identify and troubleshoot.
+* The integration tests currently cover different stages/scenarios of the MLflow lifecycle, including promotion/evaluation and model registration/artifact logging.
+
+### 4. System test coverage
+
+* A separate end-to-end system test will cover the complete workflow as a single flow.
+* This will provide full system-level validation while keeping the integration tests focused on individual scenarios.
+
+## Test Strategy
+
+The current approach is:
+
+**Unit Tests → Individual functions/components**
+**Integration Tests → 4 scenario-based tests covering different MLflow interactions**
+**System Test → 1 complete end-to-end workflow**
+
+This separation is intended to provide focused failure identification at the integration level while still maintaining complete end-to-end coverage through the system test.
+
+## Validation
+
+* All added/updated pytest test cases have been executed successfully.
+* Existing test cases were also validated to ensure there are no regressions.
+
+
+ntegration coverage has been split into four scenario-based test cases, with a separate end-to-end system test planned to validate the complete workflow.”
+  The integration tests cover the identified scenarios individually, while the complete end-to-end system test will validate the overall workflow. Any scenarios or interactions not covered by the integration tests will be additionally validated during system testing to ensure comprehensive coverage.
