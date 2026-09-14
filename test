@@ -1,364 +1,415 @@
-# create_tiny_bart_model.py
+```python
+import pandas as pd
+import mlflow
 
-from pathlib import Path
-
-from tokenizers import Tokenizer
-from tokenizers.models import WordLevel
-from tokenizers.pre_tokenizers import Whitespace
-
-from transformers import (
-    BartConfig,
-    BartForConditionalGeneration,
-    PreTrainedTokenizerFast,
-)
+import mlflow_utils
 
 
-# =========================================================
-# Configuration
-# =========================================================
+def test_mlflow_run_metadata_and_input_output_artifacts(
+    monkeypatch,
+    mlflow_server,
+    tmp_path,
+):
+    # ------------------------------------------------------------------
+    # 1. Configure MLflow to use the local test server
+    # ------------------------------------------------------------------
 
-MODEL_DIR = (
-    Path(__file__).resolve().parent
-    / "models"
-    / "tiny-bart-summarizer"
-)
+    mlflow.set_tracking_uri(mlflow_server)
 
+    monkeypatch.setattr(
+        mlflow_utils,
+        "MLFLOW_REGISTRY_URI",
+        mlflow_server,
+    )
 
-# =========================================================
-# 1. Create tiny tokenizer
-# =========================================================
+    config = mlflow_utils.configure_mlflow()
 
-def create_tokenizer():
+    assert config["tracking_uri"] == mlflow_server
+    assert config["use_unity_catalog"] is False
 
-    # -----------------------------------------------------
-    # Very small vocabulary.
+    # ------------------------------------------------------------------
+    # 2. Create test input
     #
-    # This tokenizer is ONLY for integration testing.
-    # -----------------------------------------------------
+    # Use the same basic columns expected by the actual
+    # summarization pipeline:
+    # product
+    # therapeutic_area
+    # ingestion_date
+    # TEXT
+    # ------------------------------------------------------------------
 
-    words = [
-        "<pad>",
-        "<s>",
-        "</s>",
-        "<unk>",
+    df = pd.DataFrame(
+        {
+            "product": ["ABC", "ABC"],
+            "therapeutic_area": [
+                "Respiratory",
+                "Respiratory",
+            ],
+            "ingestion_date": [
+                "2025-06-01",
+                "2025-06-15",
+            ],
+            "TEXT": [
+                "This is the first test document.",
+                "This is the second test document.",
+            ],
+        }
+    )
 
-        "the",
-        "a",
-        "an",
-        "this",
-        "is",
-        "sample",
-        "document",
-        "text",
-        "used",
-        "to",
-        "validate",
-        "the",
-        "summarization",
-        "pipeline",
-        "test",
-        "data",
-        "model",
-        "summary",
-        "information",
-        "patient",
-        "health",
-        "clinical",
-        "research",
-        "study",
-        "treatment",
-        "disease",
-        "drug",
-        "vaccine",
-        "oncology",
-        "respiratory",
-        "important",
-        "result",
-        "analysis",
-        "medical",
-        "therapy",
-        "condition",
-        "response",
-        "note",
-        "provider",
-        "physician",
-        "hcp",
-        "msl",
-        "call",
-        "outcome",
-        "generated",
-    ]
+    # ------------------------------------------------------------------
+    # 3. Create physical input file
+    #
+    # The actual pipeline logs input.xlsx as an artifact.
+    # ------------------------------------------------------------------
 
-    # Remove duplicates while preserving order
-    words = list(dict.fromkeys(words))
+    input_file = tmp_path / "input.xlsx"
 
-    vocab = {
-        word: index
-        for index, word in enumerate(words)
+    df.to_excel(
+        input_file,
+        index=False,
+    )
+
+    # ------------------------------------------------------------------
+    # 4. Create deterministic summary output
+    #
+    # We do NOT call the real Hugging Face summarization pipeline here.
+    # This test is verifying MLflow logging and artifact integration.
+    # ------------------------------------------------------------------
+
+    summary_results = {
+        "test_model": (
+            "This is the generated summary "
+            "for the test documents."
+        )
     }
 
-    tokenizer = Tokenizer(
-        WordLevel(
-            vocab=vocab,
-            unk_token="<unk>",
-        )
+    summary_output_df = df.copy()
+
+    summary_output_df["summary"] = [
+        "Summary of the first test document.",
+        "Summary of the second test document.",
+    ]
+
+    output_file = tmp_path / "summary.xlsx"
+
+    summary_output_df.to_excel(
+        output_file,
+        index=False,
     )
 
-    tokenizer.pre_tokenizer = Whitespace()
+    # ------------------------------------------------------------------
+    # 5. Start PARENT MLflow run
+    # ------------------------------------------------------------------
 
-    hf_tokenizer = PreTrainedTokenizerFast(
-        tokenizer_object=tokenizer,
+    with mlflow.start_run(
+        run_name="integration_test"
+    ) as parent_run:
 
-        bos_token="<s>",
-        eos_token="</s>",
-        unk_token="<unk>",
-        pad_token="<pad>",
-    )
+        parent_run_id = parent_run.info.run_id
 
-    return hf_tokenizer
+        # --------------------------------------------------------------
+        # 6. Log parent-run tags
+        # --------------------------------------------------------------
 
-
-# =========================================================
-# 2. Create tiny BART model
-# =========================================================
-
-def create_model(tokenizer):
-
-    config = BartConfig(
-
-        # -------------------------------------------------
-        # Vocabulary
-        # -------------------------------------------------
-
-        vocab_size=tokenizer.vocab_size,
-
-        # -------------------------------------------------
-        # Tiny BART architecture
-        # -------------------------------------------------
-
-        d_model=32,
-
-        encoder_layers=1,
-        decoder_layers=1,
-
-        encoder_attention_heads=2,
-        decoder_attention_heads=2,
-
-        encoder_ffn_dim=64,
-        decoder_ffn_dim=64,
-
-        # -------------------------------------------------
-        # Token IDs
-        # -------------------------------------------------
-
-        pad_token_id=tokenizer.pad_token_id,
-        bos_token_id=tokenizer.bos_token_id,
-        eos_token_id=tokenizer.eos_token_id,
-
-        decoder_start_token_id=tokenizer.pad_token_id,
-
-        # -------------------------------------------------
-        # Disable dropout for deterministic testing
-        # -------------------------------------------------
-
-        dropout=0.0,
-        attention_dropout=0.0,
-        activation_dropout=0.0,
-
-        # -------------------------------------------------
-        # Small positional embeddings
-        # -------------------------------------------------
-
-        max_position_embeddings=512,
-
-        # -------------------------------------------------
-        # No forced BOS
-        # -------------------------------------------------
-
-        forced_bos_token_id=None,
-        forced_eos_token_id=None,
-    )
-
-    model = BartForConditionalGeneration(config)
-
-    return model
-
-
-# =========================================================
-# 3. Main
-# =========================================================
-
-def main():
-
-    MODEL_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    print("=" * 60)
-    print("Creating tiny BART test model")
-    print("=" * 60)
-
-    # -----------------------------------------------------
-    # Tokenizer
-    # -----------------------------------------------------
-
-    print("\nCreating tokenizer...")
-
-    tokenizer = create_tokenizer()
-
-    print(
-        f"Vocabulary size: {tokenizer.vocab_size}"
-    )
-
-    # -----------------------------------------------------
-    # Model
-    # -----------------------------------------------------
-
-    print("\nCreating BART model...")
-
-    model = create_model(tokenizer)
-
-    total_parameters = sum(
-        parameter.numel()
-        for parameter in model.parameters()
-    )
-
-    print(
-        f"Model parameters: {total_parameters:,}"
-    )
-
-    # -----------------------------------------------------
-    # Save model
-    # -----------------------------------------------------
-
-    print("\nSaving model...")
-
-    model.save_pretrained(
-        MODEL_DIR,
-        safe_serialization=True,
-    )
-
-    # -----------------------------------------------------
-    # Save tokenizer
-    # -----------------------------------------------------
-
-    print("Saving tokenizer...")
-
-    tokenizer.save_pretrained(
-        MODEL_DIR
-    )
-
-    # -----------------------------------------------------
-    # Test local loading
-    # -----------------------------------------------------
-
-    print("\nTesting local reload...")
-
-    from transformers import (
-        AutoTokenizer,
-        AutoModelForSeq2SeqLM,
-    )
-
-    loaded_tokenizer = AutoTokenizer.from_pretrained(
-        str(MODEL_DIR),
-        local_files_only=True,
-    )
-
-    loaded_model = AutoModelForSeq2SeqLM.from_pretrained(
-        str(MODEL_DIR),
-        local_files_only=True,
-    )
-
-    print(
-        "Reload successful."
-    )
-
-    # -----------------------------------------------------
-    # Test tokenizer
-    # -----------------------------------------------------
-
-    test_text = (
-        "This is a sample document "
-        "used to validate the summarization pipeline."
-    )
-
-    encoded = loaded_tokenizer(
-        test_text
-    )
-
-    print(
-        f"Test input tokens: "
-        f"{len(encoded['input_ids'])}"
-    )
-
-    # -----------------------------------------------------
-    # Final
-    # -----------------------------------------------------
-
-    print("\n" + "=" * 60)
-    print("Tiny BART model created successfully")
-    print("=" * 60)
-
-    print(
-        f"\nLocation:\n{MODEL_DIR}"
-    )
-
-    print(
-        "\nFiles:"
-    )
-
-    for file in sorted(MODEL_DIR.iterdir()):
-        print(
-            f"  {file.name:<30} "
-            f"{file.stat().st_size:,} bytes"
+        mlflow_utils.set_run_tags(
+            description="MLflow integration test",
+            product="ABC",
+            run_type="inference",
+            run_scope="summarization_pipeline",
+            run_id=parent_run_id,
+            capability="abstractive summarization",
+            dataset_version="test_v1",
+            git_sha="test-sha",
         )
 
+        # --------------------------------------------------------------
+        # 7. Log environment
+        # --------------------------------------------------------------
 
-if __name__ == "__main__":
-    main()
+        mlflow_utils.log_environment()
 
+        # --------------------------------------------------------------
+        # 8. Log parameters
+        # --------------------------------------------------------------
 
-########
+        mlflow_utils.log_parameters(
+            {
+                "chunk_size": 4000,
+                "batch_size": 2,
+                "max_length": 3000,
+                "min_tokens": 100,
+            }
+        )
 
-@pytest.fixture
-def local_summarization_model():
+        # --------------------------------------------------------------
+        # 9. Log MLflow DATASET INPUT
+        #
+        # Same mechanism used in the actual pipeline.
+        # --------------------------------------------------------------
 
-    from pathlib import Path
+        dataset = mlflow.data.from_pandas(
+            df,
+            source=str(input_file),
+            name="summarization_input",
+        )
 
-    from transformers import (
-        AutoTokenizer,
-        AutoModelForSeq2SeqLM,
-        pipeline,
+        mlflow.log_input(
+            dataset,
+            context="inference",
+        )
+
+        # --------------------------------------------------------------
+        # 10. Log physical INPUT artifact
+        #
+        # Same artifact path used by the actual pipeline.
+        # --------------------------------------------------------------
+
+        mlflow_utils.log_artifact(
+            str(input_file),
+            artifact_path="input",
+        )
+
+        # --------------------------------------------------------------
+        # 11. Log SUMMARY OUTPUT artifact
+        #
+        # The actual pipeline saves the summary output and then
+        # logs the resulting file as an MLflow artifact.
+        # --------------------------------------------------------------
+
+        mlflow_utils.log_artifact(
+            str(output_file),
+            artifact_path="output",
+        )
+
+        # --------------------------------------------------------------
+        # 12. Start EVALUATION child run
+        # --------------------------------------------------------------
+
+        with mlflow.start_run(
+            run_name="Evaluation",
+            nested=True,
+        ) as evaluation_run:
+
+            evaluation_run_id = (
+                evaluation_run.info.run_id
+            )
+
+            # ----------------------------------------------------------
+            # 13. Evaluation-run tags
+            # ----------------------------------------------------------
+
+            mlflow_utils.set_run_tags(
+                description="Evaluation Metrics",
+                product="ABC",
+                run_type="evaluation",
+                run_scope="scoring",
+                run_id=evaluation_run_id,
+                capability="abstractive summarization",
+                dataset_version="test_v1",
+                git_sha="test-sha",
+            )
+
+            # ----------------------------------------------------------
+            # 14. Evaluation metrics
+            # ----------------------------------------------------------
+
+            mlflow.log_metric(
+                "rougeL",
+                0.80,
+            )
+
+            mlflow.log_metric(
+                "bert_f1",
+                0.85,
+            )
+
+            mlflow.log_metric(
+                "meteor",
+                0.75,
+            )
+
+            mlflow.log_metric(
+                "factual_consistency",
+                0.90,
+            )
+
+    # ==================================================================
+    # 15. Read PARENT run back from MLflow
+    # ==================================================================
+
+    stored_parent_run = mlflow.get_run(
+        parent_run_id
     )
 
-    model_path = (
-        Path(__file__).resolve().parent.parent
-        / "03_models"
-        / "02_evaluate"
-        / "models"
-        / "tiny-bart-summarizer"
-    ).resolve()
+    assert stored_parent_run.info.status == "FINISHED"
 
-    assert model_path.exists(), (
-        f"Model path does not exist: {model_path}"
+    # ------------------------------------------------------------------
+    # 16. Verify parameters
+    # ------------------------------------------------------------------
+
+    assert (
+        stored_parent_run.data.params["chunk_size"]
+        == "4000"
     )
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        str(model_path),
-        local_files_only=True,
+    assert (
+        stored_parent_run.data.params["batch_size"]
+        == "2"
     )
 
-    model = AutoModelForSeq2SeqLM.from_pretrained(
-        str(model_path),
-        local_files_only=True,
+    assert (
+        stored_parent_run.data.params["max_length"]
+        == "3000"
     )
 
-    model_pipeline = pipeline(
-        "summarization",
-        model=model,
-        tokenizer=tokenizer,
+    assert (
+        stored_parent_run.data.params["min_tokens"]
+        == "100"
     )
 
-    return model_pipeline
+    # ------------------------------------------------------------------
+    # 17. Verify environment parameters
+    # ------------------------------------------------------------------
 
+    assert "platform" in stored_parent_run.data.params
+
+    # ------------------------------------------------------------------
+    # 18. Verify parent tags
+    # ------------------------------------------------------------------
+
+    assert (
+        stored_parent_run.data.tags["run_type"]
+        == "inference"
+    )
+
+    assert (
+        stored_parent_run.data.tags["run_scope"]
+        == "summarization_pipeline"
+    )
+
+    assert (
+        stored_parent_run.data.tags["capability"]
+        == "abstractive summarization"
+    )
+
+    assert (
+        stored_parent_run.data.tags["dataset_version"]
+        == "test_v1"
+    )
+
+    assert (
+        stored_parent_run.data.tags["git_sha"]
+        == "test-sha"
+    )
+
+    # ==================================================================
+    # 19. Verify MLflow DATASET INPUT
+    # ==================================================================
+
+    dataset_inputs = (
+        stored_parent_run.inputs.dataset_inputs
+    )
+
+    assert len(dataset_inputs) == 1
+
+    dataset_input = dataset_inputs[0]
+
+    assert (
+        dataset_input.dataset.name
+        == "summarization_input"
+    )
+
+    assert any(
+        tag.key == "mlflow.data.context"
+        and tag.value == "inference"
+        for tag in dataset_input.tags
+    )
+
+    # ==================================================================
+    # 20. Verify physical INPUT artifact
+    # ==================================================================
+
+    client = mlflow.MlflowClient()
+
+    input_artifacts = client.list_artifacts(
+        parent_run_id,
+        path="input",
+    )
+
+    assert any(
+        artifact.path.endswith("input.xlsx")
+        for artifact in input_artifacts
+    )
+
+    # ==================================================================
+    # 21. Verify SUMMARY OUTPUT artifact
+    # ==================================================================
+
+    output_artifacts = client.list_artifacts(
+        parent_run_id,
+        path="output",
+    )
+
+    assert any(
+        artifact.path.endswith("summary.xlsx")
+        for artifact in output_artifacts
+    )
+
+    # ==================================================================
+    # 22. Read EVALUATION run back from MLflow
+    # ==================================================================
+
+    stored_evaluation_run = mlflow.get_run(
+        evaluation_run_id
+    )
+
+    assert (
+        stored_evaluation_run.info.status
+        == "FINISHED"
+    )
+
+    # ------------------------------------------------------------------
+    # 23. Verify evaluation metrics
+    # ------------------------------------------------------------------
+
+    assert (
+        stored_evaluation_run.data.metrics["rougeL"]
+        == 0.80
+    )
+
+    assert (
+        stored_evaluation_run.data.metrics["bert_f1"]
+        == 0.85
+    )
+
+    assert (
+        stored_evaluation_run.data.metrics["meteor"]
+        == 0.75
+    )
+
+    assert (
+        stored_evaluation_run.data.metrics[
+            "factual_consistency"
+        ]
+        == 0.90
+    )
+
+    # ------------------------------------------------------------------
+    # 24. Verify evaluation tags
+    # ------------------------------------------------------------------
+
+    assert (
+        stored_evaluation_run.data.tags["run_type"]
+        == "evaluation"
+    )
+
+    assert (
+        stored_evaluation_run.data.tags["run_scope"]
+        == "scoring"
+    )
+
+    assert (
+        stored_evaluation_run.data.tags["capability"]
+        == "abstractive summarization"
+    )
+```
