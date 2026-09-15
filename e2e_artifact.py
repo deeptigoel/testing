@@ -756,3 +756,28 @@ For system testing, the actual model will be retrieved from the Databricks works
 
 ntegration coverage has been split into four scenario-based test cases, with a separate end-to-end system test planned to validate the complete workflow.”
   The integration tests cover the identified scenarios individually, while the complete end-to-end system test will validate the overall workflow. Any scenarios or interactions not covered by the integration tests will be additionally validated during system testing to ensure comprehensive coverage.
+
+
+
+
+  ### Testing Experimentation
+
+As part of the integration testing experimentation, two MLflow tracking fixtures were added to `conftest.py`:
+
+1. **Real MLflow server + SQLite backend** — used to validate integration with an actual MLflow tracking server.
+2. **Direct SQLite tracking** — used for selected scenarios without starting an MLflow server.
+
+These setups were explored to understand the MLflow tracking behaviour and determine the appropriate approach for different test scenarios. The server-based setup was used where applicable, while one test currently uses the direct SQLite approach due to local server stability issues encountered during testing.
+
+This is considered a pragmatic setup for the current integration tests. The **real MLflow server-based workflow will be covered and validated through the complete end-to-end system test**.
+
+
+### Additional Fixes and Validations
+
+* **Promotion threshold logic:** Validated the promotion threshold logic and confirmed that the promotion criteria/card are aligned with the expected threshold behaviour.
+
+* **Dependency/version conflicts:** Resolved the existing `Hugging Face Hub`, `mlflow`, and metrics/transformers version compatibility issues. Since moving to a different server/environment was not required at this stage, the conflicting dependency (`mlflow`-related scoring component) was removed and the scoring implementation was aligned with the existing `transformers` and metrics versions.
+
+* **Model version registration:** Validated model version registration to ensure that the registered model/version is created successfully and is correctly visible in the MLflow UI/Experiments as expected.
+
+* **Score precision:** Verified that scores are not rounded prematurely before the relevant calculations/promotion logic are applied, ensuring that the original score precision is retained throughout the calculation flow.
